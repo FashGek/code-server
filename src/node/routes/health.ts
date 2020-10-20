@@ -1,22 +1,17 @@
+import { Router } from "express"
 import { Heart } from "../heart"
-import { HttpProvider, HttpProviderOptions, HttpResponse } from "../http"
+import { memo } from "../util"
 
-/**
- * Check the heartbeat.
- */
-export class HealthHttpProvider extends HttpProvider {
-  public constructor(options: HttpProviderOptions, private readonly heart: Heart) {
-    super(options)
-  }
+const route = (heart: Heart): Router => {
+  const router = Router()
 
-  public async handleRequest(): Promise<HttpResponse> {
-    return {
-      cache: false,
-      mime: "application/json",
-      content: {
-        status: this.heart.alive() ? "alive" : "expired",
-        lastHeartbeat: this.heart.lastHeartbeat,
-      },
-    }
-  }
+  router.get("/", (_, res) => {
+    res.json({
+      status: heart.alive() ? "alive" : "expired",
+      lastHeartbeat: heart.lastHeartbeat,
+    })
+  })
+  return router
 }
+
+export = memo(route)

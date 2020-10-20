@@ -1,73 +1,67 @@
 import { field, logger } from "@coder/logger"
-import * as http from "http"
+import { Router } from "express"
+import { promises as fs } from "fs"
 import * as path from "path"
 import { Readable } from "stream"
 import * as tarFs from "tar-fs"
 import * as zlib from "zlib"
-import { HttpProvider, HttpResponse, Route } from "../http"
-import { pathToFsPath } from "../util"
+import { HttpCode, HttpError } from "../../common/http"
+import { DefaultedArgs } from "../cli"
+import { rootPath } from "../constants"
+import { asyncRoute, authenticated, replaceTemplates } from "../http"
+import { memo, getMediaMime, pathToFsPath } from "../util"
 
-/**
- * Static file HTTP provider. Static requests do not require authentication if
- * the resource is in the application's directory except requests to serve a
- * directory as a tar which always requires authentication.
- */
-export class StaticHttpProvider extends HttpProvider {
-  public async handleRequest(route: Route, request: http.IncomingMessage): Promise<HttpResponse> {
-    this.ensureMethod(request)
+const router = Router()
 
-    if (typeof route.query.tar === "string") {
-      this.ensureAuthenticated(request)
-      return this.getTarredResource(request, pathToFsPath(route.query.tar))
-    }
+const route = (args: DefaultedArgs): Router => {
+  router.get(
+    // The commit is for caching.
+    "/:commit*",
+    asyncRoute(async (req, res) => {
+      const resourcePath = path.resolve(req.params[0])
 
-    const response = await this.getReplacedResource(request, route)
-    if (!this.isDev) {
-      response.cache = true
-    }
-    return response
-  }
-
-  /**
-   * Return a resource with variables replaced where necessary.
-   */
-  protected async getReplacedResource(request: http.IncomingMessage, route: Route): Promise<HttpResponse> {
-    // The first part is always the commit (for caching purposes).
-    const split = route.requestPath.split("/").slice(1)
-
-    const resourcePath = path.resolve("/", ...split)
-
-    // Make sure it's in code-server or a plugin.
-    const validPaths = [this.rootPath, process.env.PLUGIN_DIR]
-    if (!validPaths.find((p) => p && resourcePath.startsWith(p))) {
-      this.ensureAuthenticated(request)
-    }
-
-    switch (split[split.length - 1]) {
-      case "manifest.json": {
-        const response = await this.getUtf8Resource(resourcePath)
-        return this.replaceTemplates(route, response)
+      // Make sure it's in code-server if you aren't authenticated. This lets
+      // unauthenticated users load the login assets.
+      if (!resourcePath.startsWith(rootPath) && !authenticated(args.auth, req, args.password)) {
+        throw new HttpError("Unauthorized", HttpCode.Unauthorized)
       }
-    }
-    return this.getResource(resourcePath)
-  }
 
-  /**
-   * Tar up and stream a directory.
-   */
-  private async getTarredResource(request: http.IncomingMessage, ...parts: string[]): Promise<HttpResponse> {
-    const filePath = path.join(...parts)
-    let stream: Readable = tarFs.pack(filePath)
-    const headers: http.OutgoingHttpHeaders = {}
-    if (request.headers["accept-encoding"] && request.headers["accept-encoding"].includes("gzip")) {
-      logger.debug("gzipping tar", field("filePath", filePath))
-      const compress = zlib.createGzip()
-      stream.pipe(compress)
-      stream.on("error", (error) => compress.destroy(error))
-      stream.on("close", () => compress.end())
-      stream = compress
-      headers["content-encoding"] = "gzip"
-    }
-    return { stream, filePath, mime: "application/x-tar", cache: true, headers }
-  }
+      // Don't cache during development. - can also be used if you want to make a
+      // static request without caching.
+      if (req.params.commit !== "development" && req.params.commit !== "-") {
+        res.header("Cache-Control", "public, max-age=31536000")
+      }
+
+      const tar = Array.isArray(req.query.tar) ? req.query.tar[0] : req.query.tar
+      if (typeof tar === "string") {
+        let stream: Readable = tarFs.pack(pathToFsPath(tar))
+        if (req.headers["accept-encoding"] && req.headers["accept-encoding"].includes("gzip")) {
+          logger.debug("gzipping tar", field("path", resourcePath))
+          const compress = zlib.createGzip()
+          stream.pipe(compress)
+          stream.on("error", (error) => compress.destroy(error))
+          stream.on("close", () => compress.end())
+          stream = compress
+          res.header("content-encoding", "gzip")
+        }
+        res.set("Content-Type", "application/x-tar")
+        stream.on("close", () => res.end())
+        return stream.pipe(res)
+      }
+
+      res.set("Content-Type", getMediaMime(resourcePath))
+
+      if (resourcePath.endsWith("manifest.json")) {
+        const content = await fs.readFile(resourcePath, "utf8")
+        return res.send(replaceTemplates(req, content))
+      }
+
+      const content = await fs.readFile(resourcePath)
+      return res.send(content)
+    }),
+  )
+
+  return router
 }
+
+export = memo(route)
